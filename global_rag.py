@@ -75,21 +75,95 @@ def create_embedding(text):
     
     return embedding
 
+def chunk_text(text, chunk_size=4000, overlap=200):
+    """Split text into smaller chunks with overlap."""
+    if DEBUG_MODE:
+        print(f"DEBUG: Chunking text of length {len(text)}")
+    
+    chunks = []
+    start = 0
+    text_length = len(text)
+    
+    while start < text_length:
+        end = start + chunk_size
+        
+        # If this is not the last chunk, try to find a good breaking point
+        if end < text_length:
+            # Try to find the last period or newline in the overlap region
+            last_period = text.rfind('.', end - overlap, end)
+            last_newline = text.rfind('\n', end - overlap, end)
+            break_point = max(last_period, last_newline)
+            
+            if break_point != -1:
+                end = break_point + 1
+            
+        chunk = text[start:end].strip()
+        if chunk:  # Only add non-empty chunks
+            chunks.append(chunk)
+        
+        start = end - overlap if end < text_length else text_length
+    
+    if DEBUG_MODE:
+        print(f"DEBUG: Created {len(chunks)} chunks")
+    
+    return chunks
+
 def add_to_chroma(text, metadata=None):
-    """Add document to ChromaDB."""
+    """Add document to ChromaDB with chunking."""
     if DEBUG_MODE:
         print(f"DEBUG: Adding to ChromaDB. Text length: {len(text)}, Metadata: {metadata}")
     
-    embedding = create_embedding(text)
+    # Chunk the text
+    chunks = chunk_text(text)
+    
+    # Prepare batch data
+    embeddings = []
+    documents = []
+    metadatas = []
+    ids = []
+    
+    base_id = collection.count() + 1
+    
+    for i, chunk in enumerate(chunks):
+        embedding = create_embedding(chunk)
+        chunk_metadata = metadata.copy() if metadata else {}
+        chunk_metadata.update({'chunk_index': i, 'total_chunks': len(chunks)})
+        
+        embeddings.append(embedding)
+        documents.append(chunk)
+        metadatas.append(chunk_metadata)
+        ids.append(f"{base_id}_{i}")
+    
+    # Add all chunks to the database
     collection.add(
-        embeddings=[embedding],
-        documents=[text],
-        metadatas=[metadata] if metadata else None,
-        ids=[str(collection.count() + 1)]
+        embeddings=embeddings,
+        documents=documents,
+        metadatas=metadatas,
+        ids=ids
     )
     
     if DEBUG_MODE:
-        print(f"DEBUG: Document added to ChromaDB. New collection count: {collection.count()}")
+        print(f"DEBUG: Added {len(chunks)} chunks to ChromaDB. New collection count: {collection.count()}")
+
+def get_embedding_options():
+    """Get unique document options for the dropdown, grouping chunks together."""
+    all_docs = collection.get()
+    
+    # Create a dictionary to group chunks by original filename
+    grouped_docs = {}
+    for id, meta in zip(all_docs['ids'], all_docs['metadatas']):
+        if 'filename' not in meta:
+            continue
+            
+        filename = meta['filename']
+        base_id = id.split('_')[0]  # Get the base ID without chunk number
+        
+        if filename not in grouped_docs:
+            grouped_docs[filename] = {'ids': [], 'base_id': base_id}
+        grouped_docs[filename]['ids'].append(id)
+    
+    # Create options list with one entry per original document
+    return [f"{filename} (ID: {info['base_id']})" for filename, info in grouped_docs.items()]
 
 def similarity_search(query, k=5, ids=None):
     """Perform similarity search on ChromaDB using cosine similarity."""
@@ -99,9 +173,22 @@ def similarity_search(query, k=5, ids=None):
     
     try:
         if ids:
+            # Convert base IDs to all related chunk IDs
+            all_docs = collection.get()
+            chunk_ids = []
+            for base_id in ids:
+                # Find all chunks that start with this base ID
+                chunk_ids.extend([
+                    id for id in all_docs['ids'] 
+                    if id.startswith(base_id)
+                ])
+            
             # If specific IDs are provided, fetch those documents first
-            print(f"DEBUG: Fetching documents with IDs: {ids}")
-            specific_docs = collection.get(ids=ids, include=['documents', 'metadatas', 'embeddings'])
+            print(f"DEBUG: Fetching documents with IDs: {chunk_ids}")
+            specific_docs = collection.get(
+                ids=chunk_ids, 
+                include=['documents', 'metadatas', 'embeddings']
+            )
             print(f"DEBUG: Fetched documents: {specific_docs}")
             
             if not specific_docs['ids']:
@@ -140,9 +227,14 @@ def similarity_search(query, k=5, ids=None):
         return [], [], []
 
 def get_ai_response(query, context, model):
-    """Get AI-generated response using OpenAI's chat completion."""
+    """Get AI-generated response using OpenAI's chat completion with context management."""
     if DEBUG_MODE:
         print(f"DEBUG: Getting AI response. Query: {query}, Context length: {len(context)}, Model: {model}")
+    
+    # Limit context to avoid token limits
+    max_context_length = 3000  # Adjust based on model
+    if len(context) > max_context_length:
+        context = context[:max_context_length] + "..."
     
     messages = [
         {"role": "system", "content": "You are a helpful assistant. Use the provided context to answer the user's question accurately and concisely."},
@@ -182,10 +274,6 @@ def print_chroma_contents():
             print("---")
     except Exception as e:
         print(f"Error checking ChromaDB contents: {str(e)}")
-
-def get_embedding_options():
-    all_docs = collection.get()
-    return [f"{meta['filename']} (ID: {id})" for id, meta in zip(all_docs['ids'], all_docs['metadatas'])]
 
 def set_background():
     # Set page background
@@ -303,8 +391,8 @@ def main():
     # Embedding selection
     st.sidebar.subheader("Select Embeddings")
     doc_options = get_embedding_options()
-    selected_docs = st.sidebar.multiselect("Select embeddings to include in search:", doc_options)
-    selected_ids = [doc.split("(ID: ")[-1][:-1] for doc in selected_docs]
+    selected_docs = st.sidebar.multiselect("Select documents to include in search:", doc_options)
+    selected_ids = [doc.split("(ID: ")[-1][:-1] for doc in selected_docs]  # Now these are base IDs
 
     # Delete selected embeddings
     if st.sidebar.button("Delete Selected Embeddings"):
