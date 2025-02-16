@@ -1,0 +1,137 @@
+import time
+import mss
+from PIL import Image, ImageDraw
+import io
+import base64
+import openai
+from dotenv import load_dotenv
+import os
+
+# Set your OpenAI API key
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+
+
+# Debug mode flag
+DEBUG_MODE = False
+
+
+# Load environment variables from .env file
+load_dotenv()
+
+
+
+# Define the region of the screen where captions appear.
+caption_region = {
+    "top": 700,    # Adjust based on your screen
+    "left": 100,   # Adjust based on your caption position
+    "width": 800,  # Width of the region
+    "height": 100  # Height of the region
+}
+
+# List to store captured images
+captured_images = []
+
+def capture_captions(interval=2):
+    """
+    Continuously capture screenshots of the defined caption region.
+    A red rectangle is drawn on each screenshot to highlight the area.
+    Press Ctrl+C to stop capturing.
+    """
+    with mss.mss() as sct:
+        try:
+            while True:
+                screenshot = sct.grab(caption_region)
+                # Convert the screenshot to a PIL Image
+                img = Image.frombytes("RGB", screenshot.size, screenshot.rgb)
+                
+                # Draw a red rectangle on the border to indicate the capture area
+                draw = ImageDraw.Draw(img)
+                draw.rectangle(
+                    [(0, 0), (img.width - 1, img.height - 1)], 
+                    outline="red", 
+                    width=3
+                )
+                
+                captured_images.append(img)
+                print("Captured a caption screenshot with highlighted rectangle.")
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            print("\nCapturing stopped by user (Ctrl+C detected).")
+
+def merge_images(images):
+    """
+    Merge a list of PIL Images vertically into one image.
+    """
+    if not images:
+        return None
+
+    widths, heights = zip(*(img.size for img in images))
+    max_width = max(widths)
+    total_height = sum(heights)
+
+    merged_image = Image.new("RGB", (max_width, total_height))
+    y_offset = 0
+    for img in images:
+        merged_image.paste(img, (0, y_offset))
+        y_offset += img.size[1]
+
+    return merged_image
+
+def process_with_openai(image):
+    """
+    Convert the PIL image to base64, then send it to OpenAI's vision API
+    (using the new client interface) to extract text.
+    """
+    # Convert the image to a base64-encoded string
+    img_bytes = io.BytesIO()
+    image.save(img_bytes, format="PNG")
+    img_bytes.seek(0)
+    base64_image = base64.b64encode(img_bytes.read()).decode('utf-8')
+
+    # Use the new client interface (note: the client property "chat.completions.create" is used)
+    response = openai.Client(api_key=openai.api_key).chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "Extract the text from this image."},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Please read and return all the text."},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}}
+            ]}
+        ],
+        max_tokens=500,
+    )
+
+    return response.choices[0].message.content
+
+def remove_duplicate_lines(text):
+    """
+    Remove duplicate lines from the text while preserving the original order.
+    """
+    seen = set()
+    result_lines = []
+    for line in text.splitlines():
+        stripped_line = line.strip()
+        if stripped_line and stripped_line not in seen:
+            seen.add(stripped_line)
+            result_lines.append(line)
+    return "\n".join(result_lines)
+
+if __name__ == '__main__':
+    print("Starting caption capture with highlighted region. Press Ctrl+C to stop capturing.")
+    capture_captions(interval=2)  # Adjust the interval as needed
+
+    merged_image = merge_images(captured_images)
+    if merged_image:
+        # Optionally display the merged image
+        merged_image.show()
+
+        # Process the merged image with OpenAI's vision API
+        extracted_text = process_with_openai(merged_image)
+        print("\nRaw Extracted Text:\n", extracted_text)
+
+        # Remove duplicate lines from the extracted text
+        cleaned_text = remove_duplicate_lines(extracted_text)
+        print("\nCleaned Extracted Text (Duplicates Removed):\n", cleaned_text)
+    else:
+        print("No images were captured.")
